@@ -1,0 +1,149 @@
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
+
+/* MassFlowRGComponent.jsx
+
+A self-contained React component that performs a Mass-Flow RG sweep on the Sierpinski carpet graph using the discrete Laplacian worker (eigenWorker.js must be available at /eigenWorker.js).
+
+Features:
+
+Builds fractal graph (generateCarpet)
+
+Builds adjacency and Laplacian (dense fallback)
+
+Spawns worker and calls diagonalize to compute chi(m^2)
+
+Sweeps m^2 logarithmically and computes beta(m^2) ≈ -d ln χ / d ln m^2
+
+Estimates fixed point m^2* and stability exponent 1/ν
+
+Lightweight SVG plotting (log-x axis) of β vs m^2 and χ vs m^2
+
+
+Notes:
+
+For large N you must replace dense diagonalization with WASM/Lanczos
+
+eigenWorker.js should implement the message contract: postMessage({ok:true,result}) where result includes { chi, lambda, N } even if returnEigenvectors=false */
+
+
+// -------------------- Utilities (fractal graph + linear algebra helpers) -------------------- const generateCarpet = (generation) => { const points = []; const size = Math.pow(3, generation); const isHole = (x, y) => { while (x > 0 || y > 0) { if (x % 3 === 1 && y % 3 === 1) return true; x = Math.floor(x / 3); y = Math.floor(y / 3); } return false; }; for (let x = 0; x < size; x++) for (let y = 0; y < size; y++) if (!isHole(x, y)) points.push({ x, y }); const cx = (size - 1) / 2; const cy = (size - 1) / 2; return points.map(p => ({ x: p.x - cx, y: p.y - cy })); };
+
+const buildPointMap = (points) => { const map = new Map(); points.forEach((p, i) => map.set(${p.x},${p.y}, i)); return map; };
+
+const buildAdjacency = (points) => { const pointMap = buildPointMap(points); const adjacency = new Map(); const deltas = [-1, 0, 1]; for (const p of points) { const key = ${p.x},${p.y}; const neighbors = []; for (const dx of deltas) for (const dy of deltas) { if (dx === 0 && dy === 0) continue; const nk = ${p.x + dx},${p.y + dy}; if (pointMap.has(nk)) neighbors.push(nk); } adjacency.set(key, neighbors); } return { adjacency, pointMap }; };
+
+const buildLaplacianMatrix = (points, adjacency) => { const N = points.length; const idx = new Map(); points.forEach((p, i) => idx.set(${p.x},${p.y}, i)); const L = Array.from({ length: N }, () => new Float64Array(N).fill(0)); for (let i = 0; i < N; i++) { const key = ${points[i].x},${points[i].y}; const neighbors = adjacency.get(key) || []; L[i][i] = neighbors.length; for (const nk of neighbors) { const j = idx.get(nk); if (j !== undefined) L[i][j] = -1; } } return { L }; };
+
+function linearFit(x, y) { const n = x.length; if (n < 2) return { slope: NaN, intercept: NaN }; const meanX = x.reduce((a,b)=>a+b,0)/n; const meanY = y.reduce((a,b)=>a+b,0)/n; let covXY = 0, varX = 0; for (let i=0;i<n;i++){ covXY += (x[i]-meanX)(y[i]-meanY); varX += (x[i]-meanX)**2; } if (Math.abs(varX) < 1e-12) return { slope: Infinity, intercept: meanY }; const slope = covXY/varX; const intercept = meanY - slopemeanX; return { slope, intercept }; }
+
+// Worker wrapper: starts worker and returns promise for diagonalize const startEigenWorker = () => (window.Worker ? new Worker('/eigenWorker.js') : null); const diagonalizeInWorker = (worker, Lrows, opts = {}) => new Promise((resolve, reject) => { const onMsg = (ev) => { const d = ev.data; worker.removeEventListener('message', onMsg); if (d.ok) resolve(d.result); else reject(new Error(d.error || 'worker error')); }; worker.addEventListener('message', onMsg); worker.postMessage({ cmd: 'diagonalize', L: Lrows, ...opts }); });
+
+// -------------------- Lightweight SVG plotting helpers -------------------- const SvgPlot = ({ dataLine, xLog = true, width = 680, height = 240, yLabel = '' }) => { if (!dataLine || dataLine.length === 0) return <div style={{height}} />; const pad = 40; const innerW = width - pad2; const innerH = height - pad2; const xs = dataLine.map(d => d.x); const ys = dataLine.map(d => d.y); const xMin = Math.min(...xs); const xMax = Math.max(...xs); const yMin = Math.min(...ys); const yMax = Math.max(...ys); const xTrans = (v) => { const t = xLog ? (Math.log(v) - Math.log(xMin)) / (Math.log(xMax) - Math.log(xMin)) : (v - xMin) / (xMax - xMin); return pad + Math.max(0, Math.min(1, t)) * innerW; }; const yTrans = (v) => pad + innerH - ( (v - yMin) / (yMax - yMin||1) ) * innerH; const path = dataLine.map((p,i)=>${i===0?'M':'L'} ${xTrans(p.x)} ${yTrans(p.y)}).join(' '); return ( <svg width={width} height={height}> <rect x={0} y={0} width={width} height={height} fill="#fff" stroke="#ddd" /> <g> <path d={path} stroke="#1a73e8" strokeWidth={2} fill="none" /> </g> <g> {/* X ticks /} {[0,0.25,0.5,0.75,1].map((t,i)=>{ const xv = xLog ? Math.exp(Math.log(xMin) + t(Math.log(xMax)-Math.log(xMin))) : xMin + t*(xMax-xMin); return ( <g key={i} transform={translate(${xTrans(xv)}, ${height-pad+6})}> <text x={0} y={0} fontSize={10} textAnchor="middle">{xLog? Number(xv).toExponential(1) : xv.toFixed(2)}</text> </g> ); })} </g> <g> <text x={12} y={18} fontSize={12} fill="#333">{yLabel}</text> </g> </svg> ); };
+
+// -------------------- React Component -------------------- export default function MassFlowRGComponent(){ const [worker, setWorker] = useState(null); const [computing, setComputing] = useState(false); const [log, setLog] = useState([]); const [rgFlowResults, setRgFlowResults] = useState([]); const [rgFixedPoint, setRgFixedPoint] = useState(null); const [generation, setGeneration] = useState(4); const [m2MinExp, setM2MinExp] = useState(-3); const [m2MaxExp, setM2MaxExp] = useState(1); const [steps, setSteps] = useState(15);
+
+useEffect(()=>{ const w = startEigenWorker(); setWorker(w); return ()=> w && w.terminate(); }, []); const appendLog = (s)=> setLog(l=>[${new Date().toLocaleTimeString()}: ${s}, ...l].slice(0,50));
+
+const runMassFlowRG = useCallback(async () => { if (!worker) { appendLog('WebWorker unavailable'); return; } setComputing(true); setRgFlowResults([]); setRgFixedPoint(null); appendLog(Starting Mass-Flow RG sweep (gen=${generation})); try { const pointsG = generateCarpet(generation); const { adjacency } = buildAdjacency(pointsG); const { L } = buildLaplacianMatrix(pointsG, adjacency); const Lrows = L; // dense rows
+
+// build m2 sweep
+  const m2Values = Array.from({length: steps}, (_,i) => Math.pow(10, m2MinExp + i*(m2MaxExp - m2MinExp)/(steps-1)));
+  const results = [];
+  for (const m2 of m2Values){
+    appendLog(`Diagonalizing for m^2=${m2.toExponential(3)} (N=${Lrows.length})`);
+    // worker should return {chi, lambda, N}
+    const res = await diagonalizeInWorker(worker, Lrows, { m2, returnEigenvectors:false, computeSusceptibility:true });
+    if (!res) throw new Error('No result from worker');
+    results.push({ m2, chi: res.chi });
+    appendLog(`m^2=${m2.toExponential(3)}  χ=${Number(res.chi).toExponential(4)}`);
+  }
+
+  // compute beta approx: -d ln χ / d ln m2 using central diffs -> assign to midpoints
+  const logm = results.map(r=>Math.log(r.m2));
+  const logc = results.map(r=>Math.log(Math.max(r.chi, 1e-20)));
+  const flowData = [];
+  for (let i=0;i<results.length-1;i++){
+    const dm = logm[i+1]-logm[i]; const dc = logc[i+1]-logc[i]; const slope = dc/dm; const beta = -slope;
+    const mid = Math.exp((logm[i+1]+logm[i])/2);
+    flowData.push({ m2: mid, beta });
+  }
+  setRgFlowResults(flowData);
+
+  // Fit near critical region (smallest m2 half of flowData)
+  const near = flowData.slice(0, Math.max(2, Math.floor(flowData.length/3)));
+  if (near.length >= 2){
+    const xs = near.map(d=>d.m2); const ys = near.map(d=>d.beta);
+    // perform fit in log-space for x stability: linearFit on ln(x) vs y
+    const lnxs = xs.map(Math.log); const yvals = ys;
+    const { slope: beta_prime, intercept } = linearFit(lnxs, yvals);
+    // root solve for beta=0 -> intercept + beta_prime * ln(m2*) = 0
+    const ln_m2_star = -intercept / (beta_prime || 1e-12);
+    const m2_star = Math.exp(ln_m2_star);
+    const nu_inv = beta_prime; // approximate
+    setRgFixedPoint({ m2_star, nu_inv });
+    appendLog(`Estimated m^2*=${m2_star.toExponential(4)}, 1/ν≈${nu_inv.toFixed(4)}`);
+  } else {
+    appendLog('Not enough flow points to estimate fixed point');
+  }
+
+} catch (err){ appendLog(`ERROR: ${err.message}`); console.error(err); }
+finally { setComputing(false); }
+
+}, [worker, generation, m2MinExp, m2MaxExp, steps]);
+
+// Prepare data for plotting const betaPlotData = useMemo(()=> rgFlowResults.map(d=>({ x:d.m2, y:d.beta })), [rgFlowResults]); const chiPlotData = useMemo(()=> rgFlowResults.map(d=>({ x:d.m2, y: (()=>{ const r = rgFlowResults.find(rr=>Math.abs(Math.log(rr.m2)-Math.log(d.m2))<1e-9); return r? r.beta:0; })() })), [rgFlowResults]);
+
+return ( <div style={{fontFamily:'sans-serif', padding:12}}> <h3>Mass-Flow RG — β(m²) Extraction</h3> <div style={{display:'flex', gap:12}}> <div style={{minWidth:260}}> <label>Generation (fixed lattice): {generation}</label> <input type="range" min={1} max={4} value={generation} onChange={(e)=>setGeneration(Number(e.target.value))} />
+
+<label>m² sweep range: 10^{m2MinExp} → 10^{m2MaxExp}</label>
+      <div style={{display:'flex', gap:8}}>
+        <input type="number" value={m2MinExp} step={0.1} onChange={(e)=>setM2MinExp(Number(e.target.value))} />
+        <input type="number" value={m2MaxExp} step={0.1} onChange={(e)=>setM2MaxExp(Number(e.target.value))} />
+      </div>
+
+      <label>Steps: {steps}</label>
+      <input type="range" min={6} max={40} value={steps} onChange={(e)=>setSteps(Number(e.target.value))} />
+
+      <div style={{marginTop:8}}>
+        <button onClick={runMassFlowRG} disabled={computing || !worker}>{computing? 'RUNNING...' : 'Run Mass-Flow RG Sweep'}</button>
+      </div>
+
+      {rgFixedPoint && (
+        <div style={{marginTop:12, padding:8, background:'#f6f9ff', border:'1px solid #e1e8ff'}}>
+          <div><strong>Fixed point estimate</strong></div>
+          <div>m²* ≈ {rgFixedPoint.m2_star.toExponential(4)}</div>
+          <div>1/ν ≈ {rgFixedPoint.nu_inv.toFixed(4)}</div>
+        </div>
+      )}
+
+      <div style={{marginTop:12}}>
+        <strong>Log</strong>
+        <div style={{maxHeight:240,overflow:'auto',background:'#fff',padding:8,border:'1px solid #eee'}}>
+          {log.map((l,i)=>(<div key={i} style={{fontSize:12}}>{l}</div>))}
+        </div>
+      </div>
+
+    </div>
+
+    <div style={{flex:1}}>
+      <h4>β(m²) (midpoint finite-diff) — Log-x</h4>
+      <SvgPlot dataLine={betaPlotData} xLog={true} yLabel={'β(m²)'} />
+      <div style={{height:12}} />
+      <h4>χ diagnostics (derived)</h4>
+      <div style={{height:220}}>
+        {/* lightweight placeholder; show table instead */}
+        <table style={{width:'100%',fontSize:12}}>
+          <thead><tr><th>m² (mid)</th><th>β</th></tr></thead>
+          <tbody>
+            {rgFlowResults.map((d,i)=> (
+              <tr key={i}><td>{d.m2.toExponential(3)}</td><td>{d.beta.toFixed(4)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+); }
+
